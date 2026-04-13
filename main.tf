@@ -1,5 +1,5 @@
 /**
- * Copyright 2025 Google LLC
+ * Copyright 2026 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,93 +14,64 @@
  * limitations under the License.
  */
 
-locals {
-  _ctx_p = "$"
-  _resource = (
-    var.managed
-    ? try(google_vertex_ai_reasoning_engine.managed[0], null)
-    : try(google_vertex_ai_reasoning_engine.unmanaged[0], null)
-  )
-  bucket_name = (
-    var.deployment_files.package_config != null && var.bucket_config.create
-    ? google_storage_bucket.default[0].name
-    : coalesce(var.bucket_config.name, var.name)
-  )
-  ctx = {
-    for k, v in var.context : k => {
-      for kk, vv in v : "${local._ctx_p}${k}:${kk}" => vv
-    } if k != "condition_vars"
+resource "google_vertex_ai_reasoning_engine" "main" {
+  provider = google-nightly
+  display_name = var.display_name
+  description  = var.description
+  region       = var.region
+  project      = var.project_id
+
+  spec {
+    container_spec {
+      image_uri = var.image_uri #"us-central1-docker.pkg.dev/${data.google_project.project.project_id}/vertex-byoc/byoc-agent:latest" # image path
+    }
   }
-  location = lookup(
-    local.ctx.locations, var.region, var.region
-  )
-  project_id = lookup(
-    local.ctx.project_ids, var.project_id, var.project_id
-  )
-  resource = {
-    id     = local._resource.id
-    object = local._resource
+
+  depends_on = [google_project_iam_member.vertex_ar_reader, google_project_iam_member.tenant_ar_reader]
+}
+
+
+# Provision and retrieve the tenant service agent through another agent
+resource "google_vertex_ai_reasoning_engine" "tenant_mds" {
+  provider = google-nightly
+  display_name = coalesce(var.display_name, "-mds")
+  region       = var.region
+  project      = var.project_id
+
+  spec {
+    source_code_spec {
+      inline_source {
+        source_archive = filebase64("./test-fixtures/mds_agent_src.tar.gz")
+      }
+
+      python_spec {
+        entrypoint_module = "metadata_agent"
+        entrypoint_object = "root_agent"
+      }
+    }
   }
 }
 
-# TODO: fix once eventual consistency issue is solved.
-# AE doesn't retry the deployment (yet) if bindings are still not active.
-resource "time_sleep" "wait_5_minutes" {
-  create_duration = "5m"
-
-  depends_on = [
-    google_project_iam_member.default
-  ]
+data "google_vertex_ai_reasoning_engine_query" "tenant_mds" {
+  provider = google-nightly
+  project             = var.project_id
+  region              = var.region
+  reasoning_engine_id = google_vertex_ai_reasoning_engine.tenant_mds.name
 }
 
-resource "google_storage_bucket" "default" {
-  count = (
-    var.bucket_config.create
-    && var.deployment_files.package_config != null
-    ? 1 : 0
-  )
-  name                        = coalesce(var.bucket_config.name, var.name)
-  project                     = local.project_id
-  location                    = local.location
-  uniform_bucket_level_access = var.bucket_config.uniform_bucket_level_access
-  force_destroy               = !var.bucket_config.deletion_protection
+data "google_project" "project" {
+  project_id          = var.project_id
 }
 
-resource "google_storage_bucket_object" "dependencies" {
-  count = (
-    var.deployment_files.package_config != null
-    && var.deployment_files.package_config.are_paths_local ? 1 : 0
-  )
-  name   = "dependencies.tar.gz"
-  bucket = local.bucket_name
-  source = try(var.deployment_files.package_config.dependencies_path, null)
-  source_md5hash = filemd5(
-    try(var.deployment_files.package_config.dependencies_path, null)
-  )
+resource "google_project_iam_member" "vertex_ar_reader" {
+  project = data.google_project.project.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+  depends_on = [data.google_vertex_ai_reasoning_engine_query.tenant_mds]
 }
 
-resource "google_storage_bucket_object" "pickle" {
-  count = (
-    var.deployment_files.package_config != null
-    && var.deployment_files.package_config.are_paths_local ? 1 : 0
-  )
-  name   = "pickle.pkl"
-  bucket = local.bucket_name
-  source = try(var.deployment_files.package_config.pickle_path, null)
-  source_md5hash = filemd5(
-    try(var.deployment_files.package_config.pickle_path)
-  )
-}
-
-resource "google_storage_bucket_object" "requirements" {
-  count = (
-    var.deployment_files.package_config != null
-    && var.deployment_files.package_config.are_paths_local ? 1 : 0
-  )
-  name   = "requirements.txt"
-  bucket = local.bucket_name
-  source = try(var.deployment_files.package_config.requirements_path, null)
-  source_md5hash = filemd5(
-    try(var.deployment_files.package_config.requirements_path)
-  )
+resource "google_project_iam_member" "tenant_ar_reader" {
+  project = data.google_project.project.project_id
+  role    = "roles/artifactregistry.reader"
+  member  = "serviceAccount:${jsondecode(data.google_vertex_ai_reasoning_engine_query.tenant_mds.output).output}"
 }
